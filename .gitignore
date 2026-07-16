@@ -1,0 +1,8 @@
+venv/
+__pycache__/
+*.pyc
+.DS_Store
+*.zip
+temp_model/
+raw_share.html
+decoded_strings.txt
