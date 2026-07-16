@@ -9,14 +9,29 @@ import pyaudio
 import wave
 from pynput import keyboard
 
-# Import PyObjC speech framework components
-try:
-    from Speech import SFSpeechRecognizer, NSLocale, SFSpeechURLRecognitionRequest
-    from Foundation import NSURL, NSRunLoop, NSDefaultRunLoopMode, NSDate
-    from CoreFoundation import CFRunLoopStop, CFRunLoopGetCurrent
-except ImportError:
-    print("[X] Gagal mengimpor PyObjC Speech.")
-    sys.exit(1)
+import platform
+
+CURRENT_OS = platform.system()
+
+# Import framework sesuai OS
+if CURRENT_OS == 'Darwin':
+    try:
+        from Speech import SFSpeechRecognizer, NSLocale, SFSpeechURLRecognitionRequest
+        from Foundation import NSURL, NSRunLoop, NSDefaultRunLoopMode, NSDate
+        from CoreFoundation import CFRunLoopStop, CFRunLoopGetCurrent
+    except ImportError:
+        print("[X] Gagal mengimpor PyObjC Speech.")
+        sys.exit(1)
+else:
+    try:
+        from vosk import Model, KaldiRecognizer
+        import json
+    except ImportError:
+        pass
+    
+    # Impor controller pengetikan untuk Windows/Linux
+    from pynput.keyboard import Controller as KController, Key
+    keyboard_controller = KController()
 
 # Global variables
 transcription_result = ""
@@ -26,6 +41,7 @@ p = pyaudio.PyAudio()
 stream = None
 lang_code = "id-ID"
 current_speech_task = None
+vosk_model = None
 
 # Queue untuk mengirim event dari thread keyboard pynput ke main thread
 event_queue = queue.Queue()
@@ -54,7 +70,7 @@ def resultHandler(result, error):
             except Exception:
                 pass
 
-def transcribe_local_wav(file_path, language_code="id-ID"):
+def transcribe_local_wav_cocoa(file_path, language_code="id-ID"):
     global transcription_result, is_task_final
     transcription_result = ""
     is_task_final = False
@@ -84,6 +100,43 @@ def transcribe_local_wav(file_path, language_code="id-ID"):
     
     return transcription_result
 
+def transcribe_local_wav(file_path, language_code="id-ID"):
+    if CURRENT_OS == 'Darwin':
+        return transcribe_local_wav_cocoa(file_path, language_code)
+    else:
+        # Jalankan Vosk Offline di Windows / Linux
+        global vosk_model
+        model_path = "model"
+        if not os.path.exists(model_path):
+            print(f"\n[X] Folder '{model_path}' tidak ditemukan!")
+            print("-> Harap unduh model Vosk Bahasa Indonesia dan taruh di folder 'model'.")
+            return ""
+            
+        if vosk_model is None:
+            print("\n[+] Memuat model Vosk Offline (hanya sekali saat pertama)...")
+            try:
+                vosk_model = Model(model_path)
+            except Exception as e:
+                print(f"[X] Gagal memuat model Vosk: {e}")
+                return ""
+                
+        try:
+            wf = wave.open(str(file_path), "rb")
+            rec = KaldiRecognizer(vosk_model, wf.getframerate())
+            rec.SetWords(False)
+            
+            while True:
+                data = wf.readframes(4000)
+                if len(data) == 0:
+                    break
+                rec.AcceptWaveform(data)
+                
+            res = json.loads(rec.FinalResult())
+            return res.get("text", "")
+        except Exception as e:
+            print(f"[X] Gagal transkripsi Vosk: {e}")
+            return ""
+
 def type_text_and_enter(text):
     """
     Simulasikan keyboard mengetik teks dan menekan Enter menggunakan AppleScript
@@ -94,29 +147,69 @@ def type_text_and_enter(text):
     formatted_text = text.strip()
     formatted_text = formatted_text[0].upper() + formatted_text[1:]
     
-    escaped_text = formatted_text.replace('\\', '\\\\').replace('"', '\\"').replace('$', '\\$')
-    applescript = f'''
-    try
-        set oldClipboard to the clipboard
-    on error
-        set oldClipboard to ""
-    end try
-    
-    set the clipboard to "{escaped_text}"
-    delay 0.05
-    
-    tell application "System Events"
-        keystroke "v" using {{command down}}
+    if CURRENT_OS == 'Darwin':
+        escaped_text = formatted_text.replace('\\', '\\\\').replace('"', '\\"').replace('$', '\\$')
+        applescript = f'''
+        try
+            set oldClipboard to the clipboard
+        on error
+            set oldClipboard to ""
+        end try
+        
+        set the clipboard to "{escaped_text}"
         delay 0.05
-        key code 36 -- Enter (Return)
-    end tell
+        
+        tell application "System Events"
+            keystroke "v" using {{command down}}
+            delay 0.05
+            key code 36 -- Enter (Return)
+        end tell
+        
+        delay 0.3
+        try
+            set the clipboard to oldClipboard
+        end try
+        '''
+        subprocess.run(["osascript", "-e", applescript])
+    else:
+        # Gunakan pynput di Windows / Linux
+        keyboard_controller.type(formatted_text)
+        time.sleep(0.05)
+        keyboard_controller.press(Key.enter)
+        keyboard_controller.release(Key.enter)
+
+def handle_git_commands(text):
+    text_lower = text.lower().strip()
     
-    delay 0.3
-    try
-        set the clipboard to oldClipboard
-    end try
-    '''
-    subprocess.run(["osascript", "-e", applescript])
+    commit_prefix = ""
+    if text_lower.startswith("git commit"):
+        commit_prefix = "git commit"
+    elif text_lower.startswith("commit"):
+        commit_prefix = "commit"
+        
+    if commit_prefix:
+        raw_message = text[len(commit_prefix):].strip()
+        commit_message = raw_message if raw_message else "Update via Voice Typer"
+        
+        print(f"\n[🚀 Git Automation] Mendeteksi perintah commit & push!")
+        print(f"    Pesan commit: \"{commit_message}\"")
+        
+        try:
+            subprocess.run(["git", "add", "."], check=True)
+            subprocess.run(["git", "commit", "-m", commit_message], check=True)
+            print("    Mengunggah (push) ke GitHub...")
+            subprocess.run(["git", "push"], check=True)
+            print("[✓] Git add, commit, dan push berhasil!")
+            
+            # Tampilkan notifikasi macOS
+            subprocess.run(["osascript", "-e", "display notification \"Git Commit & Push Berhasil!\" with title \"Voice Typer Git\""])
+            return True
+        except subprocess.CalledProcessError as e:
+            print(f"[X] Gagal menjalankan perintah git: {e}")
+            subprocess.run(["osascript", "-e", "display notification \"Git Commit & Push Gagal!\" with title \"Voice Typer Git\""])
+            return True
+            
+    return False
 
 def save_wav_and_transcribe(frames):
     if not frames:
@@ -140,6 +233,8 @@ def save_wav_and_transcribe(frames):
         print(f"[✓] Hasil: \"{text}\"")
         
         if text.strip():
+            if handle_git_commands(text):
+                return
             type_text_and_enter(text)
     except Exception as e:
         print(f"[X] Gagal memproses audio: {e}")
